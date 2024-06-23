@@ -1,0 +1,163 @@
+import os
+import json
+import logging
+import pyodbc
+import pandas as pd
+from datetime import datetime
+
+# Configure logging
+logging.basicConfig(filename='housekeeping.log', level=logging.INFO, format='%(asctime)s %(message)s')
+
+def read_config(config_file):
+    with open(config_file, 'r') as file:
+        return json.load(file)
+
+def read_user_credentials(credentials_file):
+    with open(credentials_file, 'r') as file:
+        return json.load(file)
+
+def backup_table(conn, database, table):
+    """Backup the table data within Hive."""
+    backup_table = f"{database}.{table}_backup"
+    drop_backup_query = f"DROP TABLE IF EXISTS {backup_table}"
+    conn.execute(drop_backup_query)
+    create_backup_query = f"CREATE TABLE {backup_table} AS SELECT * FROM {database}.{table}"
+    conn.execute(create_backup_query)
+    return backup_table
+
+def restore_table(conn, database, table, backup_table):
+    """Restore the table data from the backup table."""
+    drop_table_query = f"DROP TABLE {database}.{table}"
+    restore_table_query = f"ALTER TABLE {backup_table} RENAME TO {database}.{table}"
+    conn.execute(drop_table_query)
+    conn.execute(restore_table_query)
+
+def construct_filter_query(filter_dict):
+    """Construct the WHERE clause for the filter condition."""
+    conditions = []
+    for key, value in filter_dict.items():
+        if isinstance(value, list):
+            conditions.append(f"{key} IN ({', '.join(f'\'{v}\'' for v in value)})")
+        elif 'DateRange' in key:
+            start_date, end_date = value.split(' to ')
+            conditions.append(f"Date >= '{start_date.strip()}' AND Date < '{end_date.strip()}'")
+        else:
+            conditions.append(f"{key} = '{value}'")
+    return " AND ".join(conditions)
+
+def purge_table(conn, database, table, filter_condition):
+    """Purge data from the table based on filter condition."""
+    query = f"DELETE FROM {database}.{table} WHERE {filter_condition}"
+    conn.execute(query)
+
+def msck_repair_table(conn, database, table):
+    """Run MSCK REPAIR TABLE command."""
+    query = f"MSCK REPAIR TABLE {database}.{table}"
+    conn.execute(query)
+
+def get_record_count(conn, database, table):
+    """Get the record count of a table."""
+    query = f"SELECT COUNT(*) FROM {database}.{table}"
+    result = conn.execute(query)
+    count = result.fetchone()[0]
+    return count
+
+def generate_reports(report_data, report_path, run_id):
+    """Generate status and reconciliation reports."""
+    report_df = pd.DataFrame(report_data)
+    report_file = os.path.join(report_path, f"recon_report_{run_id}.csv")
+    report_df.to_csv(report_file, index=False)
+
+    # Insert report into Hive table (assuming a Hive table for reports)
+    for _, row in report_df.iterrows():
+        query = (f"INSERT INTO housekeeping_reports VALUES "
+                 f"('{row['run_id']}', '{row['database']}', '{row['table']}', {row['input_records']}, "
+                 f"{row['deleted_records']}, {row['final_records']}, '{row['status']}', '{row['timestamp']}')")
+        conn.execute(query)
+
+def main():
+    config = read_config('config.json')
+    credentials = read_user_credentials('user_credentials.json')
+    report_path = config.get('report_path', '/tmp/reports')
+    os.makedirs(report_path, exist_ok=True)
+    run_id = datetime.now().strftime('%Y%m%d%H%M%S')
+
+    # Connect to Hive
+    conn = pyodbc.connect('DSN=HiveDSN;UID={};PWD={}'.format(credentials['user_id'], credentials['password']))
+
+    report_data = []
+
+    for db_name, db_content in config['Databases'].items():
+        for table_id, table_content in db_content['Tables'].items():
+            table_name = table_content['TableName']
+            filter_dict = table_content.get('Filter', {})
+            
+            try:
+                logging.info(f"Starting purge for {db_name}.{table_name}")
+                
+                # Backup table
+                backup_table_name = backup_table(conn, db_name, table_name)
+                
+                # Get initial record count
+                input_records = get_record_count(conn, db_name, table_name)
+                
+                # Construct filter query
+                filter_condition = construct_filter_query(filter_dict)
+                
+                # Get records to be deleted count
+                delete_count_query = f"SELECT COUNT(*) FROM {db_name}.{table_name} WHERE {filter_condition}"
+                delete_count_result = conn.execute(delete_count_query)
+                delete_count = delete_count_result.fetchone()[0]
+                
+                # Purge table
+                purge_table(conn, db_name, table_name, filter_condition)
+                
+                # Get final record count
+                final_records = get_record_count(conn, db_name, table_name)
+                deleted_records = input_records - final_records
+                
+                # Reconciliation check
+                if input_records != deleted_records + final_records:
+                    raise Exception(f"Reconciliation failed for {db_name}.{table_name}. Restoring backup.")
+                
+                # MSCK REPAIR TABLE
+                msck_repair_table(conn, db_name, table_name)
+                
+                # Add to report data
+                report_data.append({
+                    "run_id": run_id,
+                    "database": db_name,
+                    "table": table_name,
+                    "input_records": input_records,
+                    "deleted_records": deleted_records,
+                    "final_records": final_records,
+                    "status": 'success',
+                    "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                })
+                
+                logging.info(f"Successfully purged {db_name}.{table_name}")
+            
+            except Exception as e:
+                logging.error(f"Failed to purge {db_name}.{table_name}: {str(e)}")
+                # Restore table in case of failure
+                restore_table(conn, db_name, table_name, backup_table_name)
+                # Add failure to report data
+                report_data.append({
+                    "run_id": run_id,
+                    "database": db_name,
+                    "table": table_name,
+                    "input_records": input_records,
+                    "deleted_records": 0,
+                    "final_records": input_records,
+                    "status": 'failed',
+                    "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                })
+                continue
+
+    # Generate report
+    generate_reports(report_data, report_path, run_id)
+
+    conn.close()
+
+if __name__ == "__main__":
+    main()
