@@ -1,0 +1,143 @@
+import os
+import json
+import logging
+import pyodbc
+from datetime import datetime
+
+# Configure logging
+logging.basicConfig(filename='housekeeping.log', level=logging.INFO, format='%(asctime)s %(message)s')
+
+def read_config(config_file):
+    with open(config_file, 'r') as file:
+        return json.load(file)
+
+def read_user_credentials(credentials_file):
+    with open(credentials_file, 'r') as file:
+        return json.load(file)
+
+def backup_table(conn, database, table, backup_path):
+    """Backup the table data to a specified path."""
+    backup_table = f"{database}.{table}_backup"
+    drop_backup_query = f"DROP TABLE IF EXISTS {backup_table}"
+    conn.execute(drop_backup_query)
+    create_backup_query = f"CREATE TABLE {backup_table} AS SELECT * FROM {database}.{table}"
+    conn.execute(create_backup_query)
+    return backup_table
+
+def restore_table(conn, database, table, backup_table):
+    """Restore the table data from the backup table."""
+    drop_table_query = f"DROP TABLE {database}.{table}"
+    restore_table_query = f"ALTER TABLE {backup_table} RENAME TO {database}.{table}"
+    conn.execute(drop_table_query)
+    conn.execute(restore_table_query)
+
+def construct_filter_query(filter_dict):
+    """Construct the WHERE clause for the filter condition."""
+    conditions = []
+    for key, value in filter_dict.items():
+        if isinstance(value, list):
+            conditions.append(f"{key} IN ({', '.join(f'\'{v}\'' for v in value)})")
+        elif 'DateRange' in key:
+            start_date, end_date = value.split(' to ')
+            conditions.append(f"Date >= '{start_date.strip()}' AND Date < '{end_date.strip()}'")
+        else:
+            conditions.append(f"{key} = '{value}'")
+    return " AND ".join(conditions)
+
+def purge_table(conn, database, table, filter_condition):
+    """Purge data from the table based on filter condition."""
+    query = f"DELETE FROM {database}.{table} WHERE {filter_condition}"
+    conn.execute(query)
+
+def msck_repair_table(conn, database, table):
+    """Run MSCK REPAIR TABLE command."""
+    query = f"MSCK REPAIR TABLE {database}.{table}"
+    conn.execute(query)
+
+def get_record_count(conn, database, table):
+    """Get the record count of a table."""
+    query = f"SELECT COUNT(*) FROM {database}.{table}"
+    result = conn.execute(query)
+    count = result.fetchone()[0]
+    return count
+
+def generate_reports(conn, database, table, input_records, deleted_records, final_records, status, run_id):
+    """Generate status and reconciliation reports."""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    query = (f"INSERT INTO housekeeping_reports "
+             f"VALUES ('{run_id}', '{database}', '{table}', {input_records}, {deleted_records}, {final_records}, '{status}', '{timestamp}')")
+    conn.execute(query)
+
+def main():
+    config = read_config('config.json')
+    credentials = read_user_credentials('user_credentials.json')
+    run_id = datetime.now().strftime('%Y%m%d%H%M%S')
+
+    # Connect to Hive
+    conn = pyodbc.connect('DSN=HiveDSN;UID={};PWD={}'.format(credentials['user_id'], credentials['password']))
+
+    for db_name, db_content in config['Databases'].items():
+        for table_id, table_content in db_content['Tables'].items():
+            table_name = table_content['TableName']
+            filter_dict = table_content.get('Filter', {})
+            
+            try:
+                logging.info(f"Starting purge for {db_name}.{table_name}")
+                
+                # Backup table
+                backup_table_name = backup_table(conn, db_name, table_name, run_id)
+                
+                # Get initial record count
+                input_records = get_record_count(conn, db_name, table_name)
+                
+                # Construct filter query
+                filter_condition = construct_filter_query(filter_dict)
+                
+                # Get records to be deleted count
+                delete_count_query = f"SELECT COUNT(*) FROM {db_name}.{table_name} WHERE {filter_condition}"
+                delete_count_result = conn.execute(delete_count_query)
+                delete_count = delete_count_result.fetchone()[0]
+                
+                # Purge table
+                purge_table(conn, db_name, table_name, filter_condition)
+                
+                # Get final record count
+                final_records = get_record_count(conn, db_name, table_name)
+                deleted_records = input_records - final_records
+                
+                # Reconciliation check
+                if input_records != deleted_records + final_records:
+                    raise Exception(f"Reconciliation failed for {db_name}.{table_name}. Restoring backup.")
+                
+                # MSCK REPAIR TABLE
+                msck_repair_table(conn, db_name, table_name)
+                
+                # Generate report
+                generate_reports(conn, db_name, table_name, input_records, deleted_records, final_records, 'success', run_id)
+                
+                logging.info(f"Successfully purged {db_name}.{table_name}")
+            
+            except Exception as e:
+                logging.error(f"Failed to purge {db_name}.{table_name}: {str(e)}")
+                # Restore table in case of failure
+                restore_table(conn, db_name, table_name, backup_table_name)
+                # Generate report with failure status
+                generate_reports(conn, db_name, table_name, input_records, 0, input_records, 'failed', run_id)
+                continue
+
+    conn.close()
+
+if __name__ == "__main__":
+    main()
+
+
+Explanation:
+Configuration and Credentials Reading: Reads the database and table details, along with user credentials.
+Backup Process: Creates a backup of the table within Hive using a CREATE TABLE AS SELECT statement.
+Record Count: Gets the initial record count and the count of records to be deleted based on the filter.
+Purge Process: Deletes the records that match the filter criteria.
+Reconciliation: Checks if the sum of deleted and remaining records equals the initial count. If not, it raises an exception.
+Repair Table: Repairs the table after the purge.
+Report Generation: Generates and stores a report of the operation's status.
+Exception Handling: If any operation fails, it restores the table from the backup and logs the failure.
+Make sure to configure the DSN and ensure that the necessary tables (including housekeeping_reports) exist in your Hive database. This script assumes you have set up the appropriate ODBC DSN for Hive.
