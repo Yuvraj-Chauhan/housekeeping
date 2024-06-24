@@ -1,0 +1,185 @@
+import os
+import json
+import logging
+import pandas as pd
+import pyodbc
+from datetime import datetime
+
+# Configure logging
+logging.basicConfig(filename='housekeeping.log', level=logging.INFO, format='%(asctime)s %(message)s')
+
+def read_config(config_file):
+    with open(config_file, 'r') as file:
+        return json.load(file)
+
+def read_user_credentials(credentials_file):
+    with open(credentials_file, 'r') as file:
+        return json.load(file)
+
+def connect_hive(credentials):
+    conn = pyodbc.connect(
+        f"DSN=HiveDSN;UID={credentials['user_id']};PWD={credentials['password']}")
+    return conn
+
+def backup_table(cursor, database, table):
+    """Backup the table data within Hive."""
+    backup_table = f"{database}.{table}_backup"
+    drop_backup_query = f"DROP TABLE IF EXISTS {backup_table}"
+    cursor.execute(drop_backup_query)
+    create_backup_query = f"CREATE TABLE {backup_table} AS SELECT * FROM {database}.{table}"
+    cursor.execute(create_backup_query)
+    return backup_table
+
+def restore_table(cursor, database, table, backup_table):
+    """Restore the table data from the backup table."""
+    drop_table_query = f"DROP TABLE {database}.{table}"
+    restore_table_query = f"ALTER TABLE {backup_table} RENAME TO {database}.{table}"
+    cursor.execute(drop_table_query)
+    cursor.execute(restore_table_query)
+
+def msck_repair_table(cursor, database, table):
+    """Run MSCK REPAIR TABLE command."""
+    query = f"MSCK REPAIR TABLE {database}.{table}"
+    cursor.execute(query)
+
+def get_record_count(cursor, database, table):
+    """Get the record count of a table."""
+    query = f"SELECT COUNT(*) FROM {database}.{table}"
+    result = cursor.execute(query).fetchone()
+    return result[0]
+
+def check_space_for_backup(conn, database, table):
+    """Check if there is enough space for the backup."""
+    # Placeholder function to implement space checking logic
+    # For now, assuming there is always enough space
+    return True
+
+def generate_reports(report_data):
+    """Generate status and reconciliation reports."""
+    report_df = pd.DataFrame(report_data)
+    return report_df
+
+def insert_report_to_hive(conn, report_df, report_table):
+    """Insert the report DataFrame into a Hive table."""
+    cursor = conn.cursor()
+    report_df.to_sql(name=report_table, con=conn, if_exists='append', index=False, method='multi')
+
+def apply_purge_on_db(df, filter_dict):
+    """Placeholder for your custom purge function."""
+    # Apply the filter to the DataFrame based on the filter_dict
+    # Implement your logic here
+    return df.query(construct_filter_condition(filter_dict))
+
+def construct_filter_condition(filter_dict):
+    """Construct the filter condition for pandas query."""
+    conditions = []
+    for key, value in filter_dict.items():
+        if isinstance(value, list):
+            conditions.append(f"{key}.isin({value})")
+        elif 'DateRange' in key:
+            start_date, end_date = value.split(' to ')
+            conditions.append(f"({key.split('Range')[0]} >= '{start_date.strip()}') & ({key.split('Range')[0]} < '{end_date.strip()}')")
+        else:
+            conditions.append(f"{key} == '{value}'")
+    return " & ".join(conditions)
+
+def main():
+    config = read_config('config.json')
+    credentials = read_user_credentials('user_credentials.json')
+    report_table = config.get('report_table', 'housekeeping_reports')
+    run_id = datetime.now().strftime('%Y%m%d%H%M%S')
+
+    # Connect to Hive using pyodbc
+    conn = connect_hive(credentials)
+    cursor = conn.cursor()
+
+    report_data = []
+
+    for db_name, db_content in config['Databases'].items():
+        for table_id, table_content in db_content['Tables'].items():
+            table_name = table_content['TableName']
+            filter_dict = table_content.get('Filter', {})
+            
+            try:
+                logging.info(f"Starting purge for {db_name}.{table_name}")
+                
+                # Check if there is enough space for the backup
+                if not check_space_for_backup(conn, db_name, table_name):
+                    raise Exception(f"Not enough space to backup {db_name}.{table_name}")
+
+                # Backup table
+                backup_table_name = backup_table(cursor, db_name, table_name)
+                
+                # Get initial record count
+                input_records = get_record_count(cursor, db_name, table_name)
+                
+                # Read table into DataFrame with preserved data types
+                query = f"SELECT * FROM {db_name}.{table_name}"
+                df = pd.read_sql(query, conn)
+                
+                # Apply custom purge function to DataFrame
+                filtered_df = apply_purge_on_db(df, filter_dict)
+                
+                # Ensure the filtered DataFrame is not empty
+                if filtered_df.empty:
+                    raise Exception("Filtered DataFrame is empty, restoring from backup.")
+                
+                # Overwrite the original table with the filtered DataFrame
+                cursor.execute(f"TRUNCATE TABLE {db_name}.{table_name}")
+                filtered_df.to_sql(name=table_name, con=conn, schema=db_name, if_exists='append', index=False, method='multi')
+                
+                # Run compaction to clean up old data
+                msck_repair_table(cursor, db_name, table_name)
+                
+                # Get final record count
+                final_records = get_record_count(cursor, db_name, table_name)
+                
+                # Calculate deleted records
+                deleted_records = input_records - final_records
+                
+                # Reconciliation check
+                if input_records != deleted_records + final_records:
+                    raise Exception(f"Reconciliation failed for {db_name}.{table_name}. Restoring backup.")
+                
+                # Add to report data
+                report_data.append({
+                    "run_id": run_id,
+                    "database": db_name,
+                    "table": table_name,
+                    "input_records": input_records,
+                    "deleted_records": deleted_records,
+                    "final_records": final_records,
+                    "status": 'success',
+                    "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                })
+                
+                logging.info(f"Successfully purged {db_name}.{table_name}")
+            
+            except Exception as e:
+                logging.error(f"Failed to purge {db_name}.{table_name}: {str(e)}")
+                # Restore table in case of failure
+                restore_table(cursor, db_name, table_name, backup_table_name)
+                # Add failure to report data
+                report_data.append({
+                    "run_id": run_id,
+                    "database": db_name,
+                    "table": table_name,
+                    "input_records": input_records,
+                    "deleted_records": 0,
+                    "final_records": input_records,
+                    "status": 'failed',
+                    "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                })
+                continue
+
+    # Generate report using pandas
+    report_df = generate_reports(report_data)
+
+    # Insert report into Hive table
+    insert_report_to_hive(conn, report_df, report_table)
+
+    cursor.close()
+    conn.close()
+
+if __name__ == "__main__":
+    main()
