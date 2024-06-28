@@ -1,0 +1,51 @@
+import pyodbc
+import pandas as pd
+
+# Establish connection to Hive using ODBC
+conn = pyodbc.connect('DSN=Hive')  # Use your actual DSN configured for Hive
+
+# SQL query to fetch the table data
+query = "SELECT * FROM your_table_name"
+
+# Execute the query using pyodbc cursor
+cursor = conn.cursor()
+cursor.execute(query)
+
+# Fetch all rows from the cursor
+rows = cursor.fetchall()
+
+# Get column names from the cursor description
+columns = [column[0] for column in cursor.description]
+
+# Create a DataFrame
+df = pd.DataFrame([tuple(row) for row in rows], columns=columns)
+
+# Get column data types from the cursor description
+column_types = {column[0]: column[1] for column in cursor.description}
+
+# Map Hive data types to pandas data types
+type_mapping = {
+    pyodbc.SQL_CHAR: 'object',
+    pyodbc.SQL_VARCHAR: 'object',
+    pyodbc.SQL_DATE: 'datetime64[ns]',
+    pyodbc.SQL_TYPE_TIMESTAMP: 'datetime64[ns]',
+    pyodbc.SQL_BIGINT: 'int64',
+    pyodbc.SQL_INTEGER: 'int64',
+    pyodbc.SQL_SMALLINT: 'int64',
+    pyodbc.SQL_FLOAT: 'float64',
+    pyodbc.SQL_REAL: 'float64',
+    pyodbc.SQL_DOUBLE: 'float64',
+    pyodbc.SQL_BIT: 'bool',
+    # Add more mappings as needed
+}
+
+# Apply the schema to the DataFrame
+for column, sql_type in column_types.items():
+    pandas_type = type_mapping.get(sql_type, 'object')
+    df[column] = df[column].astype(pandas_type)
+
+# Check the dtypes of the DataFrame
+print("DataFrame dtypes after conversion:\n", df.dtypes)
+
+# Close the connection
+conn.close()
