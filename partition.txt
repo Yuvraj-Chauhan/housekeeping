@@ -1,0 +1,174 @@
+Handling partitioned tables in Hive requires additional considerations and modifications to the SQL queries used for fetching and inserting data. Partitioned tables in Hive store data in subdirectories based on the values of one or more columns, making data retrieval and insertion slightly more complex compared to non-partitioned tables.
+
+### Handling Partitioned Tables
+
+When working with partitioned tables in Hive, you typically need to:
+
+1. **Fetch Data**: Adjust the SQL query to include partition columns and fetch data accordingly.
+   
+2. **Insert Data**: Ensure that data being inserted includes values for partition columns, and adjust insertion queries accordingly.
+
+Let's modify the `fetch_table` and `insert_table` functions to handle partitioned tables in Hive.
+
+### Modified Functions
+
+#### `fetch_table` Function for Partitioned Tables
+
+```python
+def fetch_table(dsn, table_name, partition_columns=None, partition_values=None):
+    """
+    Fetches data from a Hive table (including partitioned tables) and returns it as a pandas DataFrame.
+
+    Parameters:
+    - dsn (str): The Data Source Name (DSN) for Hive.
+    - table_name (str): Name of the table to fetch data from.
+    - partition_columns (list, optional): List of partition column names (default: None).
+    - partition_values (list, optional): List of partition values corresponding to partition_columns (default: None).
+
+    Returns:
+    - pd.DataFrame: DataFrame containing data from the specified Hive table.
+    """
+    # Establish connection to Hive using pyodbc
+    conn = pyodbc.connect(f'DSN={dsn}', autocommit=True)
+
+    try:
+        # Build SQL query to fetch data from the table
+        query = f"SELECT * FROM {table_name}"
+
+        # Add partition columns and values to the query if provided
+        if partition_columns and partition_values:
+            where_clause = " AND ".join(f"{col} = '{val}'" for col, val in zip(partition_columns, partition_values))
+            query = f"{query} WHERE {where_clause}"
+
+        # Execute the query using pyodbc cursor
+        cursor = conn.cursor()
+        cursor.execute(query)
+
+        # Fetch all rows and column descriptions
+        rows = cursor.fetchall()
+        columns = [column[0] for column in cursor.description]
+        column_types = [column[1] for column in cursor.description]
+
+        # Close the cursor
+        cursor.close()
+
+        # Create DataFrame with fetched data and columns
+        df = pd.DataFrame(rows, columns=columns)
+
+        # Convert columns to appropriate pandas data types based on Hive types
+        for i, col_type in enumerate(column_types):
+            if 'int' in str(col_type):
+                df[columns[i]] = pd.to_numeric(df[columns[i]], errors='coerce').fillna(0).astype('int64')
+            elif 'float' in str(col_type):
+                df[columns[i]] = pd.to_numeric(df[columns[i]], errors='coerce').fillna(0).astype('float64')
+            elif 'bool' in str(col_type):
+                df[columns[i]] = df[columns[i]].astype('bool')
+            elif 'date' in str(col_type) or 'time' in str(col_type):
+                df[columns[i]] = pd.to_datetime(df[columns[i]], errors='coerce')
+            else:
+                df[columns[i]] = df[columns[i]].astype('object')
+
+        return df
+
+    finally:
+        # Close the connection
+        conn.close()
+```
+
+#### `insert_table` Function for Partitioned Tables
+
+```python
+def insert_table(dsn, original_table_name, filtered_df, partition_columns=None, temp_table_name='temp_table_name', new_table_name='new_table_name'):
+    """
+    Inserts a pandas DataFrame into a Hive table (including partitioned tables) while preserving the original data types.
+
+    Parameters:
+    - dsn (str): The Data Source Name (DSN) for Hive.
+    - original_table_name (str): Name of the original Hive table.
+    - filtered_df (pd.DataFrame): DataFrame containing data to be inserted into Hive.
+    - partition_columns (list, optional): List of partition column names (default: None).
+    - temp_table_name (str, optional): Name of the temporary table to create in Hive (default: 'temp_table_name').
+    - new_table_name (str, optional): Name of the new permanent table to create in Hive (default: 'new_table_name').
+
+    Returns:
+    - None
+    """
+    # Establish connection to Hive using pyodbc
+    conn = pyodbc.connect(f'DSN={dsn}', autocommit=True)
+
+    try:
+        # SQL query to fetch the original table schema
+        schema_query = f"DESCRIBE {original_table_name}"
+
+        # Execute the schema query using pyodbc cursor
+        cursor = conn.cursor()
+        cursor.execute(schema_query)
+
+        # Fetch column descriptions
+        columns = [column[0] for column in cursor.fetchall()]
+
+        # Close the cursor
+        cursor.close()
+
+        # Create a temporary table in Hive (using the original table's structure)
+        create_temp_table_query = f"CREATE TABLE {temp_table_name} LIKE {original_table_name}"
+        cursor = conn.cursor()
+        cursor.execute(create_temp_table_query)
+        cursor.close()
+
+        # Insert data from filtered DataFrame into the temporary table
+        cursor = conn.cursor()
+        for index, row in filtered_df.iterrows():
+            # Prepare values including partition columns if provided
+            if partition_columns:
+                columns_with_partitions = columns + partition_columns
+                row_values = list(row) + partition_values
+            else:
+                columns_with_partitions = columns
+                row_values = list(row)
+
+            # Example: Using parameterized query with ? placeholders
+            insert_query = f"INSERT INTO {temp_table_name} ({', '.join(columns_with_partitions)}) VALUES ({', '.join(['?'] * len(columns_with_partitions))})"
+            cursor.execute(insert_query, tuple(row_values))
+        cursor.close()
+
+        # Optionally, create a permanent table based on the temporary table
+        create_permanent_table_query = f"CREATE TABLE {new_table_name} AS SELECT * FROM {temp_table_name}"
+        cursor = conn.cursor()
+        cursor.execute(create_permanent_table_query)
+        cursor.close()
+
+    finally:
+        # Close the connection
+        conn.close()
+```
+
+### Usage Example
+
+Here’s how you can use these modified functions for handling partitioned tables:
+
+```python
+# Example usage of fetch_table function for partitioned table
+dsn = 'YourHiveDSN'
+table_name = 'your_partitioned_table_name'
+partition_columns = ['partition_col1', 'partition_col2']
+partition_values = ['value1', 'value2']
+df = fetch_table(dsn, table_name, partition_columns, partition_values)
+print("Fetched DataFrame:\n", df.head())
+
+# Example usage of insert_table function for partitioned table
+filtered_df = pd.DataFrame(...)  # Your filtered DataFrame
+partition_columns = ['partition_col1', 'partition_col2']
+insert_table(dsn, table_name, filtered_df, partition_columns)
+print("Data inserted into Hive partitioned table successfully.")
+```
+
+### Notes
+
+- **Partition Columns**: When using these functions with partitioned tables, provide the list of partition column names (`partition_columns`) and their corresponding values (`partition_values`) when necessary.
+  
+- **Schema Consistency**: Ensure that the schema (columns and data types) of the temporary table (`temp_table_name`) matches those of the original table (`original_table_name`) to avoid schema mismatch errors during insertion.
+
+- **Additional Considerations**: Handle any additional configurations or requirements specific to your Hive environment, such as authentication or authorization settings.
+
+These modified functions should now handle both non-partitioned and partitioned tables in Hive, providing a more comprehensive approach for working with Hive tables using `pyodbc` and pandas in Python. Adjustments may be necessary based on specific Hive configurations or if additional functionality is required.
