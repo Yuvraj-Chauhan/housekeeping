@@ -52,3 +52,48 @@ print("DataFrame dtypes after conversion:\n", df.dtypes)
 
 # Close the connection
 conn.close()
+
+import pyodbc
+import pandas as pd
+
+# Establish connection to Hive using ODBC
+conn = pyodbc.connect('DSN=Hive')  # Use your actual DSN configured for Hive
+
+# SQL query to fetch the table data
+query = "SELECT * FROM your_table_name"
+
+# Execute the query using pyodbc cursor
+cursor = conn.cursor()
+cursor.execute(query)
+
+# Fetch all rows and column descriptions
+rows = cursor.fetchall()
+columns = [column[0] for column in cursor.description]
+column_types = [column[1] for column in cursor.description]
+
+# Create an empty DataFrame
+df = pd.DataFrame(columns=columns)
+
+# Append rows to DataFrame
+for row in rows:
+    df = df.append(dict(zip(columns, row)), ignore_index=True)
+
+# Convert columns to appropriate pandas data types
+for column, col_type in zip(columns, column_types):
+    if 'int' in col_type:
+        df[column] = df[column].astype('int64')
+    elif 'float' in col_type:
+        df[column] = df[column].astype('float64')
+    elif 'bool' in col_type:
+        df[column] = df[column].astype('bool')
+    elif 'date' in col_type or 'time' in col_type:
+        df[column] = pd.to_datetime(df[column])
+    else:
+        df[column] = df[column].astype('object')
+
+# Check the dtypes of the DataFrame after conversion
+print("DataFrame dtypes after conversion:\n", df.dtypes)
+
+# Close the cursor and connection
+cursor.close()
+conn.close()
