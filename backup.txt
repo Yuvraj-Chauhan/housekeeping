@@ -1,0 +1,92 @@
+import pyodbc
+import subprocess
+
+# Function to get the size of the table in MB
+def get_table_size(cursor, table_name):
+    cursor.execute(f"DESCRIBE FORMATTED {table_name}")
+    rows = cursor.fetchall()
+    for row in rows:
+        if 'totalSize' in row:
+            size_str = row[row.index('totalSize') + 1]
+            if size_str.endswith('B'):
+                size_mb = float(size_str[:-1]) / (1024 * 1024)
+            elif size_str.endswith('KB'):
+                size_mb = float(size_str[:-2]) / 1024
+            elif size_str.endswith('MB'):
+                size_mb = float(size_str[:-2])
+            elif size_str.endswith('GB'):
+                size_mb = float(size_str[:-2]) * 1024
+            elif size_str.endswith('TB'):
+                size_mb = float(size_str[:-2]) * 1024 * 1024
+            return size_mb
+    return 0
+
+# Function to check free space in MB
+def check_free_space():
+    command = "hdfs dfs -df -h /"  # Adjust the path as necessary
+    process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = process.communicate()
+    
+    if process.returncode != 0:
+        raise Exception(f"Error checking free space: {stderr.decode('utf-8')}")
+    
+    lines = stdout.decode('utf-8').split('\n')
+    for line in lines:
+        if line.startswith("Filesystem"):
+            continue
+        parts = line.split()
+        if len(parts) > 0:
+            free_space_str = parts[3]  # Adjust index based on your hdfs dfs -df -h output format
+            if free_space_str.endswith('G'):
+                free_space = float(free_space_str[:-1]) * 1024  # Convert GB to MB
+            elif free_space_str.endswith('T'):
+                free_space = float(free_space_str[:-1]) * 1024 * 1024  # Convert TB to MB
+            else:
+                free_space = float(free_space_str[:-1])  # Assume MB
+            return free_space
+    return 0
+
+# Establish connection to Hive
+conn = pyodbc.connect(
+    'DRIVER={your_hive_odbc_driver};'
+    'HOST=your_hive_host;'
+    'PORT=your_hive_port;'
+    'DATABASE=your_database;'
+    'UID=your_username;'
+    'PWD=your_password;'
+)
+
+cursor = conn.cursor()
+
+# Define the original table and backup table names
+original_table = 'your_original_table'
+backup_table = 'temp_table'
+
+# Get the size of the original table
+original_table_size_mb = get_table_size(cursor, original_table)
+
+# Check if enough free space is available
+free_space_mb = check_free_space()
+
+if free_space_mb < original_table_size_mb:
+    print("Not enough free space available to create the backup table.")
+else:
+    print("Enough free space available. Proceeding to create the backup table.")
+    
+    # SQL command to create a backup of the table
+    create_backup_sql = f"""
+    CREATE TABLE {backup_table} AS 
+    SELECT * FROM {original_table}
+    """
+
+    # Execute the SQL command
+    cursor.execute(create_backup_sql)
+
+    # Commit the transaction if necessary
+    conn.commit()
+
+    print(f"Backup of table '{original_table}' created successfully as '{backup_table}'.")
+
+# Close the cursor and connection
+cursor.close()
+conn.close()
